@@ -40,6 +40,7 @@ from pymammotion.transport.base import (
     AccountInUseError,
     LoginFailedError,
     ReLoginRequiredError,
+    Transport,
     TransportError,
     TransportType,
 )
@@ -87,6 +88,9 @@ from .models import (
     MammotionSpinoData,
 )
 from .services import async_setup_services
+
+PYMAMMOTION_CLOUD_SEND_LIMIT = 1200
+Transport._SEND_LIMIT = PYMAMMOTION_CLOUD_SEND_LIMIT  # noqa: SLF001
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,

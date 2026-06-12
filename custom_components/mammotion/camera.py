@@ -243,7 +243,7 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
         # Tear the device encoder down cleanly (mirrors the app's vi_switch=0 on
         # close). Harmless / no-op on new firmware that stops on its own.
         try:
-            await self.coordinator.async_send_command(
+            await self.coordinator.async_send_video_command(
                 "device_agora_join_channel_with_position", enter_state=0
             )
         except Exception as ex:  # noqa: BLE001
@@ -259,7 +259,7 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
         """
         if not self.coordinator.is_on_4g:
             return False
-        await self.coordinator.async_send_command("refresh_fpv")
+        await self.coordinator.async_send_video_command("refresh_fpv")
         return True
 
     async def _recover_stream(self) -> None:
@@ -270,9 +270,7 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
         stream subscription so it rejoins the channel.
         """
         await self.coordinator.async_send_command("send_todev_ble_sync", sync_type=3)
-        await self.coordinator.manager.get_stream_subscription(
-            self.coordinator.device.device_name, self.coordinator.device.iot_id
-        )
+        await self.coordinator.async_check_stream_expiry(force=True)
 
     async def _perform_webrtc_negotiation(
         self,
@@ -319,7 +317,7 @@ class MammotionWebRTCCamera(MammotionCameraBaseEntity):
 
     def get_ice_servers(self) -> list[RTCIceServer]:
         """Return the ICE servers from Agora API."""
-        return self.ice_servers
+        return getattr(self.coordinator, "_ice_servers", None) or []
 
 
 # Global
@@ -340,40 +338,95 @@ async def async_setup_platform_services(
             None,
         )
 
+    def _has_agora_join_fields(
+        stream_data: StreamSubscriptionResponse | None,
+    ) -> bool:
+        return bool(
+            stream_data
+            and getattr(stream_data, "appid", None)
+            and getattr(stream_data, "channelName", None)
+            and getattr(stream_data, "token", None)
+            and getattr(stream_data, "uid", None) is not None
+        )
+
+    async def _async_send_video_command(
+        mower: MammotionMowerData,
+        command: str,
+        **kwargs,
+    ) -> bool | None:
+        return await mower.reporting_coordinator.async_send_video_command(
+            command,
+            **kwargs,
+        )
+
     async def handle_refresh_stream(call: ServiceCall) -> None:
         entity_id = call.data["entity_id"]
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower:
-            stream_data = await mower.api.get_stream_subscription(
-                mower.device.device_name, mower.device.iot_id
+            (
+                stream_data,
+                _agora_response,
+            ) = await mower.reporting_coordinator.async_check_stream_expiry(
+                force=True
             )
             _LOGGER.debug("Refresh stream data : %s", stream_data)
-
-            mower.reporting_coordinator.set_stream_data(stream_data)
             mower.reporting_coordinator.async_update_listeners()
 
     async def handle_start_video(call) -> None:
         entity_id = call.data["entity_id"]
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower:
-            await mower.reporting_coordinator.join_webrtc_channel()
+            await _async_send_video_command(
+                mower,
+                "device_agora_join_channel_with_position",
+                enter_state=1,
+            )
 
     async def handle_stop_video(call) -> None:
         entity_id = call.data["entity_id"]
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower:
-            await mower.reporting_coordinator.leave_webrtc_channel()
+            await _async_send_video_command(
+                mower,
+                "device_agora_join_channel_with_position",
+                enter_state=0,
+            )
+
+    async def handle_refresh_fpv(call: ServiceCall) -> None:
+        entity_id = call.data["entity_id"]
+        mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
+        if mower:
+            await _async_send_video_command(mower, "refresh_fpv")
 
     async def handle_get_tokens(call: ServiceCall) -> ServiceResponse:
         entity_id = call.data["entity_id"]
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower is not None:
-            stream_data = mower.reporting_coordinator.get_stream_data()
+            stream_response = mower.reporting_coordinator.get_stream_data()
+            stream_data = (
+                stream_response.data
+                if stream_response is not None and stream_response.data is not None
+                else None
+            )
 
-            if not stream_data or stream_data.data is None:
+            if not _has_agora_join_fields(stream_data):
+                _LOGGER.info(
+                    "Camera token cache for %s is empty or incomplete; refreshing",
+                    entity_id,
+                )
+                stream_data, _agora_response = (
+                    await mower.reporting_coordinator.async_check_stream_expiry(
+                        force=True
+                    )
+                )
+
+            if not _has_agora_join_fields(stream_data):
+                _LOGGER.warning(
+                    "No complete Agora token data available for %s", entity_id
+                )
                 return {}
             # Return all the data needed for the Agora SDK
-            return stream_data.data.to_dict()
+            return stream_data.to_dict()
         return {}
 
     async def handle_move_forward(call: ServiceCall) -> None:
@@ -503,6 +556,7 @@ async def async_setup_platform_services(
     hass.services.async_register("mammotion", "refresh_stream", handle_refresh_stream)
     hass.services.async_register("mammotion", "start_video", handle_start_video)
     hass.services.async_register("mammotion", "stop_video", handle_stop_video)
+    hass.services.async_register("mammotion", "refresh_fpv", handle_refresh_fpv)
     hass.services.async_register(
         "mammotion",
         "get_tokens",

@@ -26,6 +26,7 @@ from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, format_m
 from homeassistant.loader import async_get_integration
 from pymammotion.aliyun.exceptions import CloudSetupError, TooManyRequestsException
 from pymammotion.client import MammotionClient
+from pymammotion.transport.base import LoginFailedError
 
 from . import store_cloud_credentials
 from .const import (
@@ -33,15 +34,49 @@ from .const import (
     CONF_ACCOUNTNAME,
     CONF_BLE_DEVICES,
     CONF_DEVICE_NAME,
+    CONF_FULL_MAP_FETCH_ENABLED,
     CONF_HAS_CLOUD_ACCOUNT,
     CONF_MOVEMENT_USE_WIFI,
     CONF_MOW_PATH_FETCH_ENABLED,
     CONF_PREFER_BLE,
     CONF_USE_WIFI,
+    CONF_VIDEO_ACCOUNT_ID,
+    CONF_VIDEO_ACCOUNTNAME,
+    CONF_VIDEO_PASSWORD,
     DEVICE_SUPPORT,
     DOMAIN,
     LOGGER,
 )
+from .video_client import MammotionVideoStreamClient
+
+
+class VideoAccountLoginFailed(Exception):
+    """Raised when secondary video account validation fails."""
+
+
+async def _async_validate_video_account(
+    flow: ConfigFlow,
+    account: str,
+    password: str,
+) -> str:
+    """Validate secondary video credentials and return the account id."""
+    integration = await async_get_integration(flow.hass, DOMAIN)
+    video_client = MammotionVideoStreamClient(
+        account,
+        password,
+        aiohttp_client.async_get_clientsession(flow.hass),
+        integration.version.split("-")[0],
+    )
+    try:
+        await video_client.async_login()
+    except LoginFailedError as err:
+        raise VideoAccountLoginFailed(str(err)) from err
+    finally:
+        await video_client.async_stop()
+
+    if video_client.user_account is None:
+        raise VideoAccountLoginFailed("login failed")
+    return video_client.user_account
 
 
 class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -203,8 +238,14 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             account = (user_input.get(CONF_ACCOUNTNAME) or "").strip()
             password = (user_input.get(CONF_PASSWORD) or "").strip()
+            video_account = (user_input.get(CONF_VIDEO_ACCOUNTNAME) or "").strip()
+            video_password = (user_input.get(CONF_VIDEO_PASSWORD) or "").strip()
+            video_account_id = None
 
-            if account and password:
+            if bool(video_account) != bool(video_password):
+                errors["base"] = "video_account_incomplete"
+
+            if account and password and not errors:
                 integration = await async_get_integration(self.hass, DOMAIN)
                 temp_client = MammotionClient(
                     ha_version=integration.version.split("-")[0]
@@ -221,6 +262,12 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
                         errors["base"] = "login_failed"
                     else:
                         user_account = temp_client.mammotion_http.login_info.userInformation.userAccount
+                        if video_account and video_password:
+                            video_account_id = await _async_validate_video_account(
+                                self,
+                                video_account,
+                                video_password,
+                            )
                         await self.async_set_unique_id(
                             user_account, raise_on_progress=False
                         )
@@ -231,6 +278,9 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
                                 CONF_ACCOUNTNAME: account,
                                 CONF_PASSWORD: password,
                                 CONF_ACCOUNT_ID: user_account,
+                                CONF_VIDEO_ACCOUNTNAME: video_account or None,
+                                CONF_VIDEO_PASSWORD: video_password or None,
+                                CONF_VIDEO_ACCOUNT_ID: video_account_id,
                                 CONF_DEVICE_NAME: self._discovered_device.name
                                 if self._discovered_device
                                 else None,
@@ -242,6 +292,9 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
                         )
                 except TooManyRequestsException:
                     return self.async_abort(reason="api_limit_exceeded")
+                except VideoAccountLoginFailed as err:
+                    LOGGER.error("Video account login failed during setup: %s", err)
+                    errors["base"] = "video_login_failed"
                 except data_entry_flow.AbortFlow:
                     raise
                 except CloudSetupError as err:
@@ -253,9 +306,11 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
                 finally:
                     await temp_client.stop()
             # BLE-only: blank credentials
-            elif not self._config.get(CONF_BLE_DEVICES):
+            elif not errors and (video_account or video_password):
+                errors["base"] = "video_account_requires_cloud_account"
+            elif not errors and not self._config.get(CONF_BLE_DEVICES):
                 errors["base"] = "no_account_no_ble"
-            else:
+            elif not errors:
                 if not self.unique_id:
                     first_mac = next(iter(self._config[CONF_BLE_DEVICES].values()))
                     await self.async_set_unique_id(first_mac, raise_on_progress=False)
@@ -278,6 +333,8 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
             {
                 vol.Optional(CONF_ACCOUNTNAME): cv.string,
                 vol.Optional(CONF_PASSWORD): cv.string,
+                vol.Optional(CONF_VIDEO_ACCOUNTNAME): cv.string,
+                vol.Optional(CONF_VIDEO_PASSWORD): cv.string,
             }
         )
         return self.async_show_form(step_id="wifi", data_schema=schema, errors=errors)
@@ -303,11 +360,17 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input:
             account = (user_input.get(CONF_ACCOUNTNAME) or "").strip()
             password = (user_input.get(CONF_PASSWORD) or "").strip()
+            video_account = (user_input.get(CONF_VIDEO_ACCOUNTNAME) or "").strip()
+            video_password = (user_input.get(CONF_VIDEO_PASSWORD) or "").strip()
 
             has_cloud_account = False
             account_id = entry.data.get(CONF_ACCOUNT_ID)
+            video_account_id = None
 
-            if account and password:
+            if bool(video_account) != bool(video_password):
+                errors["base"] = "video_account_incomplete"
+
+            if account and password and not errors:
                 integration = await async_get_integration(self.hass, DOMAIN)
                 temp_client = MammotionClient(
                     ha_version=integration.version.split("-")[0]
@@ -323,10 +386,21 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
                     ):
                         has_cloud_account = True
                         account_id = temp_client.mammotion_http.login_info.userInformation.userAccount
+                        if video_account and video_password:
+                            video_account_id = await _async_validate_video_account(
+                                self,
+                                video_account,
+                                video_password,
+                            )
                     else:
                         errors["base"] = "login_failed"
                 except TooManyRequestsException:
                     return self.async_abort(reason="api_limit_exceeded")
+                except VideoAccountLoginFailed as err:
+                    LOGGER.error(
+                        "Video account login failed during reconfigure: %s", err
+                    )
+                    errors["base"] = "video_login_failed"
                 except data_entry_flow.AbortFlow:
                     raise
                 except (CloudSetupError, HTTPException, Exception) as err:
@@ -335,13 +409,15 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
                 finally:
                     await temp_client.stop()
                     store_cloud_credentials(self.hass, entry, temp_client)
+            elif not errors and (video_account or video_password):
+                errors["base"] = "video_account_requires_cloud_account"
 
             if not errors:
                 updated_entry = self.hass.config_entries.async_get_entry(
                     self.context["entry_id"]
                 )
-                if TYPE_CHECKING:
-                    assert updated_entry
+                if updated_entry is None:
+                    updated_entry = entry
 
                 return self.async_update_reload_and_abort(
                     entry=updated_entry,
@@ -350,6 +426,9 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_ACCOUNTNAME: account or None,
                         CONF_PASSWORD: password or None,
                         CONF_ACCOUNT_ID: account_id,
+                        CONF_VIDEO_ACCOUNTNAME: video_account or None,
+                        CONF_VIDEO_PASSWORD: video_password or None,
+                        CONF_VIDEO_ACCOUNT_ID: video_account_id,
                         CONF_USE_WIFI: bool(account),
                         CONF_HAS_CLOUD_ACCOUNT: has_cloud_account,
                     },
@@ -362,6 +441,14 @@ class MammotionConfigFlow(ConfigFlow, domain=DOMAIN):
             ): cv.string,
             vol.Optional(
                 CONF_PASSWORD, default=entry.data.get(CONF_PASSWORD, "")
+            ): cv.string,
+            vol.Optional(
+                CONF_VIDEO_ACCOUNTNAME,
+                default=entry.data.get(CONF_VIDEO_ACCOUNTNAME, ""),
+            ): cv.string,
+            vol.Optional(
+                CONF_VIDEO_PASSWORD,
+                default=entry.data.get(CONF_VIDEO_PASSWORD, ""),
             ): cv.string,
         }
 
@@ -383,6 +470,9 @@ class MammotionConfigFlowHandler(OptionsFlow):
         self.mow_path_fetch_enabled = config_entry.options.get(
             CONF_MOW_PATH_FETCH_ENABLED, False
         )
+        self.full_map_fetch_enabled = config_entry.options.get(
+            CONF_FULL_MAP_FETCH_ENABLED, False
+        )
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -390,6 +480,12 @@ class MammotionConfigFlowHandler(OptionsFlow):
         """Manage the options for the custom component."""
         if user_input:
             new_prefer_ble = user_input.get(CONF_PREFER_BLE, True)
+            new_mow_path_fetch_enabled = user_input.get(
+                CONF_MOW_PATH_FETCH_ENABLED, False
+            )
+            new_full_map_fetch_enabled = user_input.get(
+                CONF_FULL_MAP_FETCH_ENABLED, False
+            )
 
             if (
                 runtime := getattr(self._config_entry, "runtime_data", None)
@@ -397,8 +493,10 @@ class MammotionConfigFlowHandler(OptionsFlow):
                 for mower in runtime.mowers:
                     mower.api.set_prefer_ble(mower.name, prefer_ble=new_prefer_ble)
                     mower.api.set_mow_path_fetch_enabled(
-                        mower.name,
-                        enabled=user_input.get(CONF_MOW_PATH_FETCH_ENABLED, False),
+                        mower.name, enabled=new_mow_path_fetch_enabled
+                    )
+                    mower.api.set_full_map_fetch_enabled(
+                        mower.name, enabled=new_full_map_fetch_enabled
                     )
 
             return self.async_create_entry(data=user_input)
@@ -416,6 +514,10 @@ class MammotionConfigFlowHandler(OptionsFlow):
                 vol.Optional(
                     CONF_MOW_PATH_FETCH_ENABLED,
                     default=self.mow_path_fetch_enabled,
+                ): cv.boolean,
+                vol.Optional(
+                    CONF_FULL_MAP_FETCH_ENABLED,
+                    default=self.full_map_fetch_enabled,
                 ): cv.boolean,
             }
         )

@@ -12,6 +12,7 @@ from pymammotion.transport import AuthError
 from pymammotion.transport.base import (
     LoginFailedError,
     NoTransportAvailableError,
+    ReLoginRequiredError,
 )
 from pymammotion.utility.constant import WorkMode
 
@@ -37,6 +38,7 @@ EXPIRED_CREDENTIAL_EXCEPTIONS = (
     AuthError,
     UnauthorizedExceptionError,
     LoginFailedError,
+    ReLoginRequiredError,
 )
 
 CONF_HAS_CLOUD_ACCOUNT: Final = "has_cloud_account"
@@ -47,6 +49,9 @@ CONF_MOW_PATH_FETCH_ENABLED: Final = "mow_path_fetch_enabled"
 CONF_FULL_MAP_FETCH_ENABLED: Final = "full_map_fetch_enabled"
 CONF_ACCOUNTNAME: Final = "account_name"
 CONF_ACCOUNT_ID: Final = "mammotion_account_id"
+CONF_VIDEO_ACCOUNTNAME: Final = "video_account_name"
+CONF_VIDEO_PASSWORD: Final = "video_password"
+CONF_VIDEO_ACCOUNT_ID: Final = "video_mammotion_account_id"
 CONF_USE_WIFI: Final = "use_wifi"
 CONF_DEVICE_NAME: Final = "device_name"
 CONF_BLE_DEVICES: Final = "ble_devices"

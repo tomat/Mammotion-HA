@@ -55,6 +55,7 @@ from .const import (
     CONF_CONNECT_DATA,
     CONF_DEVICE_DATA,
     CONF_DEVICE_NAME,
+    CONF_FULL_MAP_FETCH_ENABLED,
     CONF_HAS_CLOUD_ACCOUNT,
     CONF_MAMMOTION_DATA,
     CONF_MAMMOTION_DEVICE_LIST,
@@ -67,6 +68,8 @@ from .const import (
     CONF_SESSION_DATA,
     CONF_STAY_CONNECTED_BLUETOOTH,
     CONF_USE_WIFI,
+    CONF_VIDEO_ACCOUNTNAME,
+    CONF_VIDEO_PASSWORD,
     DEVICE_SUPPORT,
     DOMAIN,
     EXPIRED_CREDENTIAL_EXCEPTIONS,
@@ -88,6 +91,7 @@ from .models import (
     MammotionSpinoData,
 )
 from .services import async_setup_services
+from .video_client import MammotionVideoStreamClient
 
 PYMAMMOTION_CLOUD_SEND_LIMIT = 1200
 Transport._SEND_LIMIT = PYMAMMOTION_CLOUD_SEND_LIMIT  # noqa: SLF001
@@ -215,6 +219,56 @@ async def _async_attempt_login(
         return False
 
 
+async def _async_setup_video_client(
+    hass: HomeAssistant,
+    entry: MammotionConfigEntry,
+    ha_version: str,
+) -> MammotionVideoStreamClient | None:
+    """Set up the optional secondary video account."""
+    video_account = entry.data.get(CONF_VIDEO_ACCOUNTNAME)
+    video_password = entry.data.get(CONF_VIDEO_PASSWORD)
+    if not video_account or not video_password:
+        return None
+
+    client = MammotionVideoStreamClient(
+        video_account,
+        video_password,
+        aiohttp_client.async_get_clientsession(hass),
+        ha_version,
+    )
+    try:
+        await client.async_login()
+    except ClientConnectorError as err:
+        LOGGER.warning(
+            "Mammotion video account %s could not connect: %s",
+            video_account,
+            err,
+        )
+    except LoginFailedError as err:
+        LOGGER.warning(
+            "Mammotion video account %s login failed; camera stream tokens will "
+            "not fall back to the primary account: %s",
+            video_account,
+            err,
+        )
+    except Exception as err:
+        LOGGER.warning(
+            "Mammotion video account %s setup failed; camera stream tokens will "
+            "not fall back to the primary account: %s",
+            video_account,
+            err,
+        )
+    else:
+        LOGGER.info(
+            "Mammotion video account %s ready for camera stream tokens",
+            video_account,
+        )
+        return client
+
+    await client.async_stop()
+    return None
+
+
 async def _attach_ble_to_mower(
     hass: HomeAssistant,
     entry: MammotionConfigEntry,
@@ -330,10 +384,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MammotionConfigEntry) ->
 
     addresses = entry.data.get(CONF_BLE_DEVICES, {})
     integration = await async_get_integration(hass, DOMAIN)
-    mammotion = MammotionClient(ha_version=integration.version.split("-")[0])
+    ha_version = integration.version.split("-")[0]
+    mammotion = MammotionClient(ha_version=ha_version)
     account = entry.data.get(CONF_ACCOUNTNAME)
     password = entry.data.get(CONF_PASSWORD)
     use_wifi = entry.data.get(CONF_USE_WIFI, True)
+    video_client: MammotionVideoStreamClient | None = None
 
     # Migrate options: move from stay_connected_bluetooth to prefer_ble default.
     if not entry.options:
@@ -350,6 +406,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MammotionConfigEntry) ->
 
     prefer_ble = entry.options.get(CONF_PREFER_BLE, True)
     mow_path_fetch_enabled = entry.options.get(CONF_MOW_PATH_FETCH_ENABLED, False)
+    full_map_fetch_enabled = entry.options.get(CONF_FULL_MAP_FETCH_ENABLED, False)
 
     # Default to True for older entries that predate this key, as long as they
     # have account credentials configured.
@@ -455,6 +512,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MammotionConfigEntry) ->
 
             mammotion.set_mow_path_fetch_enabled(
                 device.device_name, enabled=mow_path_fetch_enabled
+            )
+            mammotion.set_full_map_fetch_enabled(
+                device.device_name, enabled=full_map_fetch_enabled
             )
 
             unique_name = device.device_name
@@ -651,14 +711,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: MammotionConfigEntry) ->
                 )
             )
 
+    if cloud_available and mammotion_mowers:
+        video_client = await _async_setup_video_client(hass, entry, ha_version)
+
     mammotion_devices.RTK = mammotion_rtk
     mammotion_devices.mowers = mammotion_mowers
     mammotion_devices.spino = mammotion_spino
+    mammotion_devices.video_client = video_client
     entry.runtime_data = mammotion_devices
 
     mammotion.setup_all_mower_watchers()
 
     async def shutdown_mammotion(_: Event | None = None) -> None:
+        if video_client is not None:
+            await video_client.async_stop()
         await mammotion.stop()
 
     entry.async_on_unload(

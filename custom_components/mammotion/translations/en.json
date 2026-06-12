@@ -10,12 +10,18 @@
       "not_supported": "Device not supported",
       "reconfigure_successful": "Re-configure successful",
       "api_limit_exceeded": "API rate limit has been exceeded. Please try again later.",
-      "account_in_use": "Your Mammotion account is already in use in another session. Sign out of the Mammotion app and try again."
+      "account_in_use": "Your Mammotion account is already in use in another session. Sign out of the Mammotion app and try again.",
+      "video_account_incomplete": "Enter both the video account and video account password, or leave both blank.",
+      "video_account_requires_cloud_account": "A secondary video account requires a primary cloud account.",
+      "video_login_failed": "Unable to log in to the secondary video account."
     },
     "error": {
       "login_failed": "Login failed. Check your account email and password, then try again.",
       "cannot_connect": "Unable to connect to the Mammotion cloud. Check your credentials and network, then try again.",
-      "no_account_no_ble": "No account details entered and no Bluetooth device found. Enter your Mammotion account credentials, or set up a Bluetooth device."
+      "no_account_no_ble": "No account details entered and no Bluetooth device found. Enter your Mammotion account credentials, or set up a Bluetooth device.",
+      "video_account_incomplete": "Enter both the video account and video account password, or leave both blank.",
+      "video_account_requires_cloud_account": "A secondary video account requires a primary cloud account.",
+      "video_login_failed": "Unable to log in to the secondary video account."
     },
     "flow_title": "{name}",
     "step": {
@@ -29,7 +35,9 @@
         "data": {
           "use_wifi": "Use Wi-Fi",
           "account_name": "Mammotion email or account number",
-          "password": "Mammotion account password"
+          "password": "Mammotion account password",
+          "video_account_name": "Secondary video account email or account number",
+          "video_password": "Secondary video account password"
         }
       },
       "user": {
@@ -43,7 +51,9 @@
         "data": {
           "use_wifi": "Use Wi-Fi (un-tick and submit to use bluetooth)",
           "account_name": "Mammotion email or account number",
-          "password": "Mammotion account password"
+          "password": "Mammotion account password",
+          "video_account_name": "Secondary video account email or account number",
+          "video_password": "Secondary video account password"
         },
         "title": "Connect to Wi-Fi",
         "description": "Enter your Mammotion account email or id and password"
@@ -65,6 +75,11 @@
     }
   },
   "entity": {
+    "binary_sensor": {
+      "non_work_hours_enabled": {
+        "name": "Non-work hours enabled"
+      }
+    },
     "sensor": {
       "error_1_message": {
         "name": "Last error"
@@ -185,21 +200,6 @@
       },
       "work_area": {
         "name": "Current location"
-      },
-      "map_sync_status": {
-        "name": "Map sync status",
-        "state": {
-          "synced": "Synced",
-          "syncing": "Syncing",
-          "out_of_sync": "Out of sync"
-        }
-      },
-      "mqtt_status": {
-        "name": "MQTT status",
-        "state": {
-          "reported_online": "Reported online",
-          "reported_offline": "Reported offline"
-        }
       },
       "task_area_status": {
         "name": "Task area {name}",

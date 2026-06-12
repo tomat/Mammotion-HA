@@ -84,13 +84,26 @@ SPINO_BUTTON_SENSORS: tuple[MammotionSpinoButtonEntityDescription, ...] = (
 
 def _nudge_available(coordinator: MammotionBaseUpdateCoordinator) -> bool:
     """Return True when movement via BLE or Wi-Fi is possible."""
-    if coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False):
-        return True
     handle = coordinator.manager.mower(coordinator.device_name)
     if handle is None:
         return False
+    if getattr(handle, "has_usable_transport", False):
+        return True
     ble = handle.get_transport(TransportType.BLE)
     return ble is not None and ble.is_usable
+
+
+def _nudge_use_wifi(
+    coordinator: MammotionBaseUpdateCoordinator,
+) -> bool | None:
+    """Return the nudge transport preference.
+
+    True explicitly forces Wi-Fi. None lets the coordinator choose BLE only
+    when it has a healthy signal, falling back to Wi-Fi otherwise.
+    """
+    if coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False):
+        return True
+    return None
 
 
 BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
@@ -115,33 +128,33 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
     ),
     MammotionButtonSensorEntityDescription(
         key="emergency_nudge_forward",
-        press_fn=lambda coordinator: coordinator.async_move_forward(
+        press_fn=lambda coordinator: coordinator.async_nudge_forward(
             0.4,
-            coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False),
+            _nudge_use_wifi(coordinator),
         ),
         available_fn=_nudge_available,
     ),
     MammotionButtonSensorEntityDescription(
         key="emergency_nudge_left",
-        press_fn=lambda coordinator: coordinator.async_move_left(
+        press_fn=lambda coordinator: coordinator.async_nudge_left(
             0.4,
-            coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False),
+            _nudge_use_wifi(coordinator),
         ),
         available_fn=_nudge_available,
     ),
     MammotionButtonSensorEntityDescription(
         key="emergency_nudge_right",
-        press_fn=lambda coordinator: coordinator.async_move_right(
+        press_fn=lambda coordinator: coordinator.async_nudge_right(
             0.4,
-            coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False),
+            _nudge_use_wifi(coordinator),
         ),
         available_fn=_nudge_available,
     ),
     MammotionButtonSensorEntityDescription(
         key="emergency_nudge_back",
-        press_fn=lambda coordinator: coordinator.async_move_back(
+        press_fn=lambda coordinator: coordinator.async_nudge_back(
             0.4,
-            coordinator.config_entry.options.get(CONF_MOVEMENT_USE_WIFI, False),
+            _nudge_use_wifi(coordinator),
         ),
         available_fn=_nudge_available,
     ),

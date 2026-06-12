@@ -61,6 +61,7 @@ from pymammotion.http.model.camera_stream import (
 )
 from pymammotion.http.model.http import ErrorInfo, Response
 from pymammotion.mammotion.commands.mammotion_command import MammotionCommand
+from pymammotion.messaging.command_queue import Priority
 from pymammotion.proto import MulSex
 from pymammotion.state.device_state import DeviceShutdownEvent, DeviceSnapshot
 from pymammotion.transport.base import (
@@ -89,6 +90,9 @@ from .const import (
     CONF_CONNECT_DATA,
     CONF_HAS_CLOUD_ACCOUNT,
     CONF_MAMMOTION_DATA,
+    CONF_PREFER_BLE,
+    CONF_VIDEO_ACCOUNTNAME,
+    CONF_VIDEO_PASSWORD,
     DOMAIN,
     EXPIRED_CREDENTIAL_EXCEPTIONS,
     LOGGER,
@@ -105,10 +109,12 @@ DEVICE_VERSION_INTERVAL = timedelta(weeks=1)
 MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
 SPINO_INTERVAL = timedelta(weeks=1)
-
-# Possible states for ``MammotionReportUpdateCoordinator.map_sync_status`` and
-# the ``map_sync_status`` diagnostic ENUM sensor that surfaces it.
-MAP_SYNC_STATUSES = ("synced", "syncing", "out_of_sync")
+MOVEMENT_NUDGE_INTERVAL = 0.2
+MOVEMENT_NUDGE_STEPS = 25
+MOVEMENT_MANUAL_KEEPALIVE_STEPS = 4
+MOVEMENT_MANUAL_START_KEEPALIVES = 2
+MOVEMENT_MANUAL_MAX_RUN_SPEED = 0.3
+MOVEMENT_BLE_MIN_RSSI = -75
 
 
 class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # type: ignore[misc]
@@ -161,8 +167,9 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self._subscriptions: list[Subscription] = []
         self.map_offset_lat: float = 0.0
         self.map_offset_lon: float = 0.0
-        self._bluetooth_enabled: bool = True
+        self._bluetooth_enabled: bool = config_entry.options.get(CONF_PREFER_BLE, True)
         self._cloud_enabled: bool = True
+        self._movement_nudge_lock = asyncio.Lock()
 
         mower_device = self.manager.get_device_by_name(self.device_name)
 
@@ -179,6 +186,86 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
     @abstractmethod
     def get_coordinator_data(self, device: MowingDevice) -> DataT:
         """Get coordinator data."""
+
+    async def _async_get_stream_subscription(
+        self,
+    ) -> Response[StreamSubscriptionResponse] | None:
+        """Fetch stream subscription data from the video account when configured."""
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        video_client = getattr(runtime_data, "video_client", None)
+
+        if video_client is not None:
+            return await video_client.async_get_stream_subscription(
+                self.device_name,
+                self.device.iot_id,
+            )
+
+        if self.config_entry.data.get(
+            CONF_VIDEO_ACCOUNTNAME
+        ) and self.config_entry.data.get(CONF_VIDEO_PASSWORD):
+            LOGGER.warning(
+                "Secondary Mammotion video account is configured but unavailable; "
+                "refusing to use the primary account for camera stream tokens"
+            )
+            return None
+
+        return await self.manager.get_stream_subscription(
+            self.device_name,
+            self.device.iot_id,
+        )
+
+    async def async_send_video_command(
+        self,
+        command: str,
+        **kwargs: Any,
+    ) -> bool | None:
+        """Send a video command through the secondary video account when configured."""
+        bypass_local_rate_limit = bool(
+            kwargs.pop("_bypass_local_rate_limit", False)
+        )
+        record_cmd = bool(kwargs.pop("_record_cmd", False))
+        runtime_data = getattr(self.config_entry, "runtime_data", None)
+        video_client = getattr(runtime_data, "video_client", None)
+        if video_client is not None:
+            try:
+                return await video_client.async_send_video_command(
+                    self.device_name,
+                    self.device.iot_id,
+                    command,
+                    _bypass_local_rate_limit=bypass_local_rate_limit,
+                    _record_cmd=record_cmd,
+                    **kwargs,
+                )
+            except Exception:
+                if not bypass_local_rate_limit:
+                    raise
+                LOGGER.warning(
+                    "Secondary Mammotion command client failed for %s; "
+                    "falling back to primary account with local rate-limit "
+                    "bypass",
+                    command,
+                    exc_info=True,
+                )
+
+        if self.config_entry.data.get(
+            CONF_VIDEO_ACCOUNTNAME
+        ) and self.config_entry.data.get(CONF_VIDEO_PASSWORD) and not bypass_local_rate_limit:
+            LOGGER.warning(
+                "Secondary Mammotion video account is configured but unavailable; "
+                "refusing to use the primary account for %s",
+                command,
+            )
+            return False
+
+        if bypass_local_rate_limit:
+            self._clear_cloud_command_rate_limits(reason=f"command {command}")
+
+        return await self.async_send_command(
+            command,
+            prefer_ble=False,
+            _record_cmd=record_cmd,
+            **kwargs,
+        )
 
     async def async_check_stream_expiry(
         self, force: bool = False
@@ -200,58 +287,71 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         stream_data = None
 
         try:
-            stream_data = await self.manager.get_stream_subscription(
-                self.device_name, self.device.iot_id
-            )
+            stream_data = await self._async_get_stream_subscription()
+            if stream_data is None:
+                self._stream_data = None
+                self._agora_response = None
+                self._ice_servers = []
+                return None, None
+
             self.set_stream_data(stream_data)
+            if stream_data.data is None:
+                LOGGER.error("Stream token response did not include stream data")
+                self._agora_response = None
+                self._ice_servers = []
+                return None, None
+
             self._stream_data_fetched_at = time.monotonic()
 
-            if stream_data is not None and stream_data.data is not None:
-                LOGGER.debug("Received stream data: %s", stream_data)
+            LOGGER.debug("Received stream data: %s", stream_data)
 
-                # Get ICE servers from Agora API
-                try:
-                    subscription = stream_data.data.to_dict()
-                    async with AgoraAPIClient() as agora_client:
-                        agora_response = await agora_client.choose_server(
-                            app_id=subscription["appid"],
-                            token=subscription["token"],
-                            channel_name=subscription["channelName"],
-                            user_id=int(subscription["uid"]),
-                            service_flags=[
-                                SERVICE_IDS["CHOOSE_SERVER"],  # Gateway addresses
-                                SERVICE_IDS["CLOUD_PROXY_FALLBACK"],  # TURN servers
-                            ],
-                        )
+            # Get ICE servers from Agora API
+            try:
+                subscription = stream_data.data.to_dict()
+                async with AgoraAPIClient() as agora_client:
+                    agora_response = await agora_client.choose_server(
+                        app_id=subscription["appid"],
+                        token=subscription["token"],
+                        channel_name=subscription["channelName"],
+                        user_id=int(subscription["uid"]),
+                        service_flags=[
+                            SERVICE_IDS["CHOOSE_SERVER"],  # Gateway addresses
+                            SERVICE_IDS["CLOUD_PROXY_FALLBACK"],  # TURN servers
+                        ],
+                    )
 
-                        # Get ICE servers and convert to RTCIceServer format - use only first TURN server to match SDK (3 entries)
-                        ice_servers_agora = agora_response.get_ice_servers(
-                            use_all_turn_servers=False
+                    # Use only the first TURN server to match SDK behavior.
+                    ice_servers_agora = agora_response.get_ice_servers(
+                        use_all_turn_servers=False
+                    )
+                    LOGGER.info("Ice Servers from Agora API:%s", ice_servers_agora)
+                    ice_servers = [
+                        RTCIceServer(
+                            urls=ice_server.urls,
+                            username=ice_server.username,
+                            credential=ice_server.credential,
                         )
-                        LOGGER.info("Ice Servers from Agora API:%s", ice_servers_agora)
-                        ice_servers = [
-                            RTCIceServer(
-                                urls=ice_server.urls,
-                                username=ice_server.username,
-                                credential=ice_server.credential,
-                            )
-                            for ice_server in ice_servers_agora
-                        ]
+                        for ice_server in ice_servers_agora
+                    ]
 
-                        # Store ICE servers in coordinator
-                        self._ice_servers = ice_servers
-                        self._agora_response = agora_response
-                        LOGGER.info(
-                            "Retrieved %d ICE servers from Agora API",
-                            len(ice_servers),
-                        )
-                except Exception as e:
-                    LOGGER.error("Failed to get ICE servers from Agora API: %s", e)
-                    self._ice_servers = []
+                    # Store ICE servers in coordinator
+                    self._ice_servers = ice_servers
+                    self._agora_response = agora_response
+                    LOGGER.info(
+                        "Retrieved %d ICE servers from Agora API",
+                        len(ice_servers),
+                    )
+            except Exception as e:
+                LOGGER.error("Failed to get ICE servers from Agora API: %s", e)
+                self._ice_servers = []
+                self._agora_response = None
 
             LOGGER.debug("Stream token refreshed successfully")
         except Exception as ex:
             LOGGER.error("Failed to refresh stream token: %s", ex)
+            self._stream_data = None
+            self._agora_response = None
+            self._ice_servers = []
         return (
             stream_data.data if stream_data is not None else None,
             self._agora_response,
@@ -314,23 +414,6 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             if ble.is_usable:
                 return True
         return bool(not handle.availability.mqtt_reported_offline)
-
-    @property
-    def mqtt_transport_connected(self) -> bool:
-        if handle := self.manager.mower(self.device_name):
-            for t_type in (TransportType.CLOUD_ALIYUN, TransportType.CLOUD_MAMMOTION):
-                if handle.is_transport_connected(t_type):
-                    return True
-        return False
-
-    @property
-    def mqtt_device_online(self) -> bool:
-        device = self.manager.get_device_by_name(self.device_name)
-        if device is None:
-            return False
-        if handle := self.manager.mower(self.device_name):
-            return bool(not handle.availability.mqtt_reported_offline)
-        return False
 
     @property
     def bluetooth_enabled(self) -> bool:
@@ -957,6 +1040,330 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             "move_back", prefer_ble=not use_wifi, linear=speed
         )
 
+    async def _async_movement_stop(self, use_wifi: bool) -> bool | None:
+        """Queue a zero-speed movement frame."""
+        return await self._async_movement_command(
+            "move_forward",
+            use_wifi,
+            linear=0.0,
+        )
+
+    async def _async_manual_drive_mode(
+        self,
+        enabled: bool,
+        use_wifi: bool,
+    ) -> bool | None:
+        """Queue the manual-drive mode command with mower blades off."""
+        return await self._async_movement_command(
+            "operate_on_device",
+            use_wifi,
+            main_ctrl=1 if enabled else 0,
+            cut_knife_ctrl=0,
+            cut_knife_height=0,
+            max_run_speed=MOVEMENT_MANUAL_MAX_RUN_SPEED,
+        )
+
+    async def _async_manual_drive_speed(self, use_wifi: bool) -> bool | None:
+        """Queue the manual-drive speed command used by the app."""
+        return await self._async_movement_command(
+            "set_speed",
+            use_wifi,
+            speed=MOVEMENT_MANUAL_MAX_RUN_SPEED,
+        )
+
+    async def _async_movement_command(
+        self,
+        command: str,
+        use_wifi: bool,
+        **kwargs: Any,
+    ) -> bool | None:
+        """Queue a nudge command on the selected movement transport."""
+        if use_wifi:
+            return await self.async_send_video_command(
+                command,
+                _record_cmd=False,
+                _priority=Priority.EMERGENCY,
+                _log_failures=True,
+                _bypass_local_rate_limit=True,
+                **kwargs,
+            )
+
+        return await self.async_send_command(
+            command,
+            prefer_ble=True,
+            _priority=Priority.EMERGENCY,
+            _log_failures=True,
+            **kwargs,
+        )
+
+    async def _async_nudge_movement(
+        self,
+        direction: str,
+        command: str,
+        speed_arg: str,
+        speed: float,
+        use_wifi: bool | None,
+    ) -> None:
+        """Send a short movement burst followed by an explicit stop frame."""
+        if self._movement_nudge_lock.locked():
+            LOGGER.warning(
+                "Emergency nudge %s queued for %s: another nudge is already active",
+                direction,
+                self.device_name,
+            )
+
+        async with self._movement_nudge_lock:
+            use_wifi = await self._async_select_movement_use_wifi(use_wifi)
+            if not use_wifi:
+                await self._async_ensure_ble_client()
+            else:
+                self._clear_cloud_command_rate_limits(
+                    reason=f"emergency nudge {direction}"
+                )
+
+            transport = "Wi-Fi" if use_wifi else "BLE"
+            duration = MOVEMENT_NUDGE_INTERVAL * MOVEMENT_NUDGE_STEPS
+            LOGGER.warning(
+                "Emergency nudge %s requested for %s over %s for %.1fs",
+                direction,
+                self.device_name,
+                transport,
+                duration,
+            )
+
+            queued = 0
+            manual_mode_queued = 0
+            try:
+                if not await self._async_manual_drive_speed(use_wifi):
+                    LOGGER.warning(
+                        "Emergency nudge %s for %s did not queue manual-drive speed",
+                        direction,
+                        self.device_name,
+                    )
+                if await self._async_manual_drive_mode(True, use_wifi):
+                    manual_mode_queued += 1
+                else:
+                    LOGGER.warning(
+                        "Emergency nudge %s for %s did not queue manual-drive start",
+                        direction,
+                        self.device_name,
+                    )
+                    return
+
+                for _ in range(MOVEMENT_MANUAL_START_KEEPALIVES):
+                    await asyncio.sleep(
+                        MOVEMENT_MANUAL_KEEPALIVE_STEPS * MOVEMENT_NUDGE_INTERVAL
+                    )
+                    if await self._async_manual_drive_mode(True, use_wifi):
+                        manual_mode_queued += 1
+
+                for step in range(MOVEMENT_NUDGE_STEPS):
+                    if (
+                        step > 0
+                        and step % MOVEMENT_MANUAL_KEEPALIVE_STEPS == 0
+                        and await self._async_manual_drive_mode(True, use_wifi)
+                    ):
+                        manual_mode_queued += 1
+                    result = await self._async_movement_command(
+                        command,
+                        use_wifi,
+                        **{speed_arg: speed},
+                    )
+                    if result:
+                        queued += 1
+                    else:
+                        LOGGER.warning(
+                            "Emergency nudge %s for %s did not queue movement step %d/%d",
+                            direction,
+                            self.device_name,
+                            step + 1,
+                            MOVEMENT_NUDGE_STEPS,
+                        )
+                    if step < MOVEMENT_NUDGE_STEPS - 1:
+                        await asyncio.sleep(MOVEMENT_NUDGE_INTERVAL)
+            except Exception:
+                LOGGER.exception(
+                    "Emergency nudge %s failed for %s",
+                    direction,
+                    self.device_name,
+                )
+                raise
+            finally:
+                try:
+                    if not await self._async_movement_stop(use_wifi):
+                        LOGGER.warning(
+                            "Emergency nudge %s for %s did not queue stop command",
+                            direction,
+                            self.device_name,
+                        )
+                except Exception:
+                    LOGGER.exception(
+                        "Emergency nudge %s could not queue stop command for %s",
+                        direction,
+                        self.device_name,
+                    )
+                    raise
+                try:
+                    if await self._async_manual_drive_mode(False, use_wifi):
+                        manual_mode_queued += 1
+                    else:
+                        LOGGER.warning(
+                            "Emergency nudge %s for %s did not queue manual-drive stop",
+                            direction,
+                            self.device_name,
+                        )
+                except Exception:
+                    LOGGER.exception(
+                        "Emergency nudge %s could not queue manual-drive stop for %s",
+                        direction,
+                        self.device_name,
+                    )
+                    raise
+
+            LOGGER.warning(
+                "Emergency nudge %s queued %d/%d movement steps and %d "
+                "manual-drive commands for %s",
+                direction,
+                queued,
+                MOVEMENT_NUDGE_STEPS,
+                manual_mode_queued,
+                self.device_name,
+            )
+
+    def _clear_cloud_command_rate_limits(self, *, reason: str) -> None:
+        """Clear local cloud send-budget latches before user-requested nudges."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return
+
+        now = time.monotonic()
+        for transport_type in (
+            TransportType.CLOUD_ALIYUN,
+            TransportType.CLOUD_MAMMOTION,
+        ):
+            transport = handle.get_transport(transport_type)
+            if transport is None:
+                continue
+
+            send_timestamps = getattr(transport, "_send_timestamps", None)
+            send_count = len(send_timestamps) if send_timestamps is not None else 0
+            rate_limited = bool(getattr(transport, "is_rate_limited", False))
+
+            gateway = getattr(transport, "_cloud_gateway", None)
+            gateway_until = getattr(gateway, "_rate_limited_until", 0.0)
+            gateway_limited = (
+                isinstance(gateway_until, (int, float)) and gateway_until > now
+            )
+
+            if rate_limited or gateway_limited or send_count:
+                LOGGER.warning(
+                    "Clearing local %s cloud send budget for %s on %s "
+                    "(transport_limited=%s, gateway_limited=%s, sent=%d)",
+                    transport_type.value,
+                    reason,
+                    self.device_name,
+                    rate_limited,
+                    gateway_limited,
+                    send_count,
+                )
+
+            if hasattr(transport, "_rate_limited_until"):
+                transport._rate_limited_until = 0.0  # noqa: SLF001
+            if send_timestamps is not None:
+                send_timestamps.clear()
+            if gateway is not None and hasattr(gateway, "_rate_limited_until"):
+                gateway._rate_limited_until = 0.0  # noqa: SLF001
+            if gateway is not None and hasattr(gateway, "_rate_limit_backoff"):
+                gateway._rate_limit_backoff = 60.0  # noqa: SLF001
+
+    def _movement_ble_rssi(self) -> int | None:
+        """Return the latest mower-reported BLE RSSI, if it looks usable."""
+        mower_data = self.manager.get_device_by_name(self.device_name) or self.data
+        try:
+            rssi = int(mower_data.report_data.connect.ble_rssi)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return rssi if rssi < 0 else None
+
+    def _movement_ble_transport_usable(self) -> bool:
+        """Return True when the BLE transport is available for movement commands."""
+        handle = self.manager.mower(self.device_name)
+        if handle is None:
+            return False
+        ble = handle.get_transport(TransportType.BLE)
+        return bool(ble is not None and ble.is_usable)
+
+    async def _async_select_movement_use_wifi(
+        self, requested_use_wifi: bool | None
+    ) -> bool:
+        """Prefer BLE for movement when RSSI is healthy, otherwise use Wi-Fi."""
+        if requested_use_wifi is True:
+            LOGGER.warning(
+                "Emergency nudge for %s using Wi-Fi because it was requested",
+                self.device_name,
+            )
+            return True
+
+        rssi = self._movement_ble_rssi()
+        if rssi is not None and rssi >= MOVEMENT_BLE_MIN_RSSI:
+            await self._async_ensure_ble_client()
+            if self._movement_ble_transport_usable():
+                LOGGER.warning(
+                    "Emergency nudge for %s using BLE; RSSI=%sdBm",
+                    self.device_name,
+                    rssi,
+                )
+                return False
+            LOGGER.warning(
+                "Emergency nudge for %s has BLE RSSI=%sdBm but no usable "
+                "BLE transport; using Wi-Fi",
+                self.device_name,
+                rssi,
+            )
+
+        if requested_use_wifi is False:
+            LOGGER.warning(
+                "Emergency nudge for %s using BLE because Wi-Fi was not "
+                "requested; RSSI=%s",
+                self.device_name,
+                rssi if rssi is not None else "unknown",
+            )
+            return False
+
+        return True
+
+    async def async_nudge_forward(
+        self, speed: float, use_wifi: bool | None = None
+    ) -> None:
+        """Nudge forward with a short movement burst."""
+        await self._async_nudge_movement(
+            "forward", "move_forward", "linear", speed, use_wifi
+        )
+
+    async def async_nudge_left(
+        self, speed: float, use_wifi: bool | None = None
+    ) -> None:
+        """Nudge left with a short movement burst."""
+        await self._async_nudge_movement(
+            "left", "move_left", "angular", speed, use_wifi
+        )
+
+    async def async_nudge_right(
+        self, speed: float, use_wifi: bool | None = None
+    ) -> None:
+        """Nudge right with a short movement burst."""
+        await self._async_nudge_movement(
+            "right", "move_right", "angular", speed, use_wifi
+        )
+
+    async def async_nudge_back(
+        self, speed: float, use_wifi: bool | None = None
+    ) -> None:
+        """Nudge back with a short movement burst."""
+        await self._async_nudge_movement(
+            "back", "move_back", "linear", speed, use_wifi
+        )
+
     async def async_rtk_dock_location(self) -> None:
         """RTK and dock location."""
         await self.async_send_and_wait(
@@ -1455,33 +1862,6 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             return "path"
 
         return name if name else f"area {area_hash}"
-
-    @property
-    def map_sync_status(self) -> str:
-        """Return the current map-sync status for diagnostics.
-
-        One of :data:`MAP_SYNC_STATUSES`:
-
-        * ``syncing`` — an exclusive sync saga (the map fetch) is running on
-          the device command queue, so the cached map is mid-refresh.
-        * ``synced`` — our local map fully matches the device's current area
-          set (``map.is_map_synced`` against the latest reported ``bol_hash``).
-        * ``out_of_sync`` — neither of the above: the cached map is stale or
-          incomplete and a fresh ``async_sync_maps()`` is needed.
-        """
-        handle = self.manager.mower(self.device_name)
-        if handle is not None and handle.queue.is_saga_active:
-            return "syncing"
-
-        if self.data is None:
-            return "out_of_sync"
-
-        mower_data = cast(MowingDevice, self.data)
-        locations = mower_data.report_data.locations
-        bol_hash = locations[0].bol_hash if locations else 0
-        if mower_data.map.is_map_synced(bol_hash):
-            return "synced"
-        return "out_of_sync"
 
 
 class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevice]):

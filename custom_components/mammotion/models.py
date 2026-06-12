@@ -14,6 +14,7 @@ from .coordinator import (
     MammotionRTKCoordinator,
     MammotionSpinoCoordinator,
 )
+from .video_client import MammotionVideoStreamClient
 
 
 @dataclass
@@ -60,3 +61,4 @@ class MammotionDevices:
     mowers: list[MammotionMowerData]
     RTK: list[MammotionRTKData]
     spino: list[MammotionSpinoData]
+    video_client: MammotionVideoStreamClient | None = None

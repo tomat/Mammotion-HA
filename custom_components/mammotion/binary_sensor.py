@@ -27,11 +27,22 @@ class MammotionBinarySensorEntityDescription(
     is_on_fn: Callable[[MowingDevice], bool | None]
 
 
+def _non_work_hours_enabled(mower_data: MowingDevice) -> bool:
+    """Return whether the configured non-work window is enabled."""
+    return bool(getattr(mower_data.non_work_hours, "trigger", 0))
+
+
 BINARY_SENSORS: tuple[MammotionBinarySensorEntityDescription, ...] = (
     MammotionBinarySensorEntityDescription(
         key="charging",
         device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
         is_on_fn=lambda mower_data: mower_data.report_data.dev.charge_state in (1, 2),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MammotionBinarySensorEntityDescription(
+        key="non_work_hours_enabled",
+        translation_key="non_work_hours_enabled",
+        is_on_fn=_non_work_hours_enabled,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
 )

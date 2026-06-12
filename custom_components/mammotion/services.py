@@ -11,8 +11,10 @@ from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, cal
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
+from pymammotion.aliyun.exceptions import DeviceOfflineException, GatewayTimeoutException
 from pymammotion.data.model.hash_list import CommDataCouple, Plan
 from pymammotion.data.model.pool_state import PoolPlan
+from pymammotion.transport.base import NoTransportAvailableError
 
 from .const import DOMAIN, LOGGER
 from .coordinator import MammotionReportUpdateCoordinator, MammotionSpinoCoordinator
@@ -236,14 +238,16 @@ def _get_mower_by_entity_id(
 
     entries: list[MammotionConfigEntry] = hass.config_entries.async_entries(DOMAIN)
     for entry in entries:
-        if not entry.runtime_data:
+        runtime_data = getattr(entry, "runtime_data", None)
+        if not runtime_data:
             continue
         mower = next(
             (
                 m
-                for m in entry.runtime_data.mowers
-                if entity_entry.unique_id.startswith(
-                    m.reporting_coordinator.unique_name
+                for m in runtime_data.mowers
+                if entity_entry.unique_id.startswith(f"{m.device.device_name}_")
+                or entity_entry.unique_id.startswith(
+                    f"{m.reporting_coordinator.unique_name}_"
                 )
             ),
             None,
@@ -268,9 +272,10 @@ def _resolve_mower_task(
         return None
 
     for cfg in hass.config_entries.async_entries(DOMAIN):
-        if not cfg.runtime_data:
+        runtime_data = getattr(cfg, "runtime_data", None)
+        if not runtime_data:
             continue
-        for mower in cfg.runtime_data.mowers:
+        for mower in runtime_data.mowers:
             prefix = mower.reporting_coordinator.unique_name + "_"
             if not entry.unique_id.startswith(prefix):
                 continue
@@ -295,9 +300,10 @@ def _resolve_spino_task(
         return None
 
     for cfg in hass.config_entries.async_entries(DOMAIN):
-        if not cfg.runtime_data:
+        runtime_data = getattr(cfg, "runtime_data", None)
+        if not runtime_data:
             continue
-        for spino in cfg.runtime_data.spino:
+        for spino in runtime_data.spino:
             prefix = spino.coordinator.unique_name + "_"
             if not entry.unique_id.startswith(prefix):
                 continue
@@ -325,12 +331,13 @@ def _resolve_device(
         return None
 
     for cfg in hass.config_entries.async_entries(DOMAIN):
-        if not cfg.runtime_data:
+        runtime_data = getattr(cfg, "runtime_data", None)
+        if not runtime_data:
             continue
-        for mower in cfg.runtime_data.mowers:
+        for mower in runtime_data.mowers:
             if entry.unique_id.startswith(mower.reporting_coordinator.unique_name):
                 return mower.reporting_coordinator, "mower"
-        for spino in cfg.runtime_data.spino:
+        for spino in runtime_data.spino:
             if entry.unique_id.startswith(spino.coordinator.unique_name):
                 return spino.coordinator, "spino"
     return None
@@ -410,8 +417,20 @@ def async_setup_services(hass: HomeAssistant) -> None:  # noqa: C901
             LOGGER.error("Could not find entity %s", call.data[ATTR_ENTITY_ID])
             return {}
         coordinator = mower.reporting_coordinator
-        if coordinator.is_online():
+        try:
             await coordinator.async_start_report_stream(duration_ms=300_000)
+        except (
+            DeviceOfflineException,
+            GatewayTimeoutException,
+            NoTransportAvailableError,
+            TimeoutError,
+        ) as exc:
+            LOGGER.warning(
+                "Could not refresh Mammotion report stream before returning geojson "
+                "for %s; returning cached geojson: %s",
+                coordinator.device_name,
+                exc,
+            )
         return apply_geojson_offset(
             coordinator.data.map.generated_geojson,
             coordinator.map_offset_lat,

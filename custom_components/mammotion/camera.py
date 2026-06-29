@@ -328,6 +328,8 @@ async def async_setup_platform_services(
 
     def _get_mower_by_entity_id(entity_id: str) -> MammotionMowerData | None:
         state = hass.states.get(entity_id)
+        if state is None:
+            return None
         name = state.attributes.get("model_name")
         return next(
             (
@@ -359,8 +361,39 @@ async def async_setup_platform_services(
             **kwargs,
         )
 
-    async def handle_refresh_stream(call: ServiceCall) -> None:
+    def _call_entity_id(call: ServiceCall) -> str:
         entity_id = call.data["entity_id"]
+        if isinstance(entity_id, list):
+            return entity_id[0]
+        return entity_id
+
+    def _call_use_wifi(call: ServiceCall) -> bool:
+        return bool(call.data.get("use_wifi", False))
+
+    def _axis_value(call: ServiceCall, field: str, entity_id: str) -> float:
+        raw_value = call.data.get(field, 0.0)
+        try:
+            value = float(raw_value)
+        except (ValueError, TypeError):
+            _LOGGER.warning(
+                "Invalid %s value for %s: %s. Using 0.0.",
+                field,
+                entity_id,
+                raw_value,
+            )
+            return 0.0
+
+        if value < -1.0 or value > 1.0:
+            _LOGGER.warning(
+                "Clamping %s value for %s: %s. Must be between -1 and 1.",
+                field,
+                entity_id,
+                value,
+            )
+        return max(-1.0, min(1.0, value))
+
+    async def handle_refresh_stream(call: ServiceCall) -> None:
+        entity_id = _call_entity_id(call)
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower:
             (
@@ -373,7 +406,7 @@ async def async_setup_platform_services(
             mower.reporting_coordinator.async_update_listeners()
 
     async def handle_start_video(call) -> None:
-        entity_id = call.data["entity_id"]
+        entity_id = _call_entity_id(call)
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower:
             await _async_send_video_command(
@@ -383,7 +416,7 @@ async def async_setup_platform_services(
             )
 
     async def handle_stop_video(call) -> None:
-        entity_id = call.data["entity_id"]
+        entity_id = _call_entity_id(call)
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower:
             await _async_send_video_command(
@@ -393,13 +426,13 @@ async def async_setup_platform_services(
             )
 
     async def handle_refresh_fpv(call: ServiceCall) -> None:
-        entity_id = call.data["entity_id"]
+        entity_id = _call_entity_id(call)
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower:
             await _async_send_video_command(mower, "refresh_fpv")
 
     async def handle_get_tokens(call: ServiceCall) -> ServiceResponse:
-        entity_id = call.data["entity_id"]
+        entity_id = _call_entity_id(call)
         mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
         if mower is not None:
             stream_response = mower.reporting_coordinator.get_stream_data()
@@ -430,12 +463,12 @@ async def async_setup_platform_services(
         return {}
 
     async def handle_move_forward(call: ServiceCall) -> None:
-        entity_id = call.data["entity_id"]
+        entity_id = _call_entity_id(call)
 
         # Check if speed parameter exists and validate it
         speed = 0.4  # Default speed
-        raw_speed = call.data["speed"]
-        use_wifi = call.data["use_wifi"]
+        raw_speed = call.data.get("speed")
+        use_wifi = _call_use_wifi(call)
         if raw_speed is not None:
             try:
                 speed_value = float(raw_speed)
@@ -461,12 +494,12 @@ async def async_setup_platform_services(
             )
 
     async def handle_move_left(call: ServiceCall) -> None:
-        entity_id = call.data["entity_id"]
+        entity_id = _call_entity_id(call)
 
         # Check if speed parameter exists and validate it
         speed = 0.4  # Default speed
-        raw_speed = call.data["speed"]
-        use_wifi = call.data["use_wifi"]
+        raw_speed = call.data.get("speed")
+        use_wifi = _call_use_wifi(call)
         if raw_speed is not None:
             try:
                 speed_value = float(raw_speed)
@@ -492,12 +525,12 @@ async def async_setup_platform_services(
             )
 
     async def handle_move_right(call: ServiceCall) -> None:
-        entity_id = call.data["entity_id"]
+        entity_id = _call_entity_id(call)
 
         # Check if speed parameter exists and validate it
         speed = 0.4  # Default speed
-        raw_speed = call.data["speed"]
-        use_wifi = call.data["use_wifi"]
+        raw_speed = call.data.get("speed")
+        use_wifi = _call_use_wifi(call)
         if raw_speed is not None:
             try:
                 speed_value = float(raw_speed)
@@ -523,12 +556,12 @@ async def async_setup_platform_services(
             )
 
     async def handle_move_backward(call: ServiceCall) -> None:
-        entity_id = call.data["entity_id"]
+        entity_id = _call_entity_id(call)
 
         # Check if speed parameter exists and validate it
         speed = 0.4  # Default speed
-        raw_speed = call.data["speed"]
-        use_wifi = call.data["use_wifi"]
+        raw_speed = call.data.get("speed")
+        use_wifi = _call_use_wifi(call)
         if raw_speed is not None:
             try:
                 speed_value = float(raw_speed)
@@ -553,6 +586,32 @@ async def async_setup_platform_services(
                 speed=speed, use_wifi=use_wifi
             )
 
+    async def handle_start_manual_drive(call: ServiceCall) -> None:
+        entity_id = _call_entity_id(call)
+        mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
+        if mower:
+            await mower.reporting_coordinator.async_start_manual_drive(
+                use_wifi=_call_use_wifi(call)
+            )
+
+    async def handle_stop_manual_drive(call: ServiceCall) -> None:
+        entity_id = _call_entity_id(call)
+        mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
+        if mower:
+            await mower.reporting_coordinator.async_stop_manual_drive(
+                use_wifi=_call_use_wifi(call)
+            )
+
+    async def handle_move_vector(call: ServiceCall) -> None:
+        entity_id = _call_entity_id(call)
+        mower: MammotionMowerData = _get_mower_by_entity_id(entity_id)
+        if mower:
+            await mower.reporting_coordinator.async_move_vector(
+                linear=_axis_value(call, "linear", entity_id),
+                angular=_axis_value(call, "angular", entity_id),
+                use_wifi=_call_use_wifi(call),
+            )
+
     hass.services.async_register("mammotion", "refresh_stream", handle_refresh_stream)
     hass.services.async_register("mammotion", "start_video", handle_start_video)
     hass.services.async_register("mammotion", "stop_video", handle_stop_video)
@@ -567,3 +626,10 @@ async def async_setup_platform_services(
     hass.services.async_register("mammotion", "move_left", handle_move_left)
     hass.services.async_register("mammotion", "move_right", handle_move_right)
     hass.services.async_register("mammotion", "move_backward", handle_move_backward)
+    hass.services.async_register(
+        "mammotion", "start_manual_drive", handle_start_manual_drive
+    )
+    hass.services.async_register(
+        "mammotion", "stop_manual_drive", handle_stop_manual_drive
+    )
+    hass.services.async_register("mammotion", "move_vector", handle_move_vector)

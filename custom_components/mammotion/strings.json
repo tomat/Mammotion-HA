@@ -503,6 +503,18 @@
       "name": "Cancel current task",
       "description": "Stops the mower and clears the current task."
     },
+    "resume_task": {
+      "name": "Resume current task",
+      "description": "Resumes an existing paused task without planning or starting a new task."
+    },
+    "break_point_continue": {
+      "name": "Continue from breakpoint",
+      "description": "Resumes an unfinished task from the mower's stored breakpoint."
+    },
+    "break_point_anywhere_continue": {
+      "name": "Continue from current position",
+      "description": "Resumes an unfinished task from the mower's current position."
+    },
     "start_mow": {
       "name": "Start mowing",
       "description": "Starts the mowing operation with custom settings.",

@@ -79,6 +79,7 @@ class MammotionVideoStreamClient:
         bypass_local_rate_limit = bool(
             kwargs.pop("_bypass_local_rate_limit", False)
         )
+        quiet_rate_limit_clear = bool(kwargs.pop("_quiet_rate_limit_clear", False))
         record_cmd = bool(kwargs.pop("_record_cmd", False))
         client, command_device_name = await self._async_get_command_client(
             device_name, iot_id
@@ -88,6 +89,7 @@ class MammotionVideoStreamClient:
                 client,
                 command_device_name,
                 reason=f"command {command}",
+                quiet=quiet_rate_limit_clear,
             )
         await client.send_command_with_args(
             command_device_name,
@@ -153,6 +155,7 @@ class MammotionVideoStreamClient:
         device_name: str,
         *,
         reason: str,
+        quiet: bool = False,
     ) -> None:
         """Clear local secondary-account send-budget latches before nudges."""
         handle = client.mower(device_name)
@@ -178,7 +181,7 @@ class MammotionVideoStreamClient:
                 isinstance(gateway_until, (int, float)) and gateway_until > now
             )
 
-            if rate_limited or gateway_limited or send_count:
+            if (rate_limited or gateway_limited or send_count) and not quiet:
                 LOGGER.warning(
                     "Clearing secondary-account %s send budget for %s on %s "
                     "(transport_limited=%s, gateway_limited=%s, sent=%d)",

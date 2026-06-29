@@ -17,6 +17,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import service
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from pymammotion.data.model.report_info import DeviceData, ReportData
@@ -29,6 +30,9 @@ from .coordinator import MammotionReportUpdateCoordinator
 from .entity import MammotionBaseEntity
 
 SERVICE_START_MOWING = "start_mow"
+SERVICE_RESUME_TASK = "resume_task"
+SERVICE_BREAK_POINT_CONTINUE = "break_point_continue"
+SERVICE_BREAK_POINT_ANYWHERE_CONTINUE = "break_point_anywhere_continue"
 SERVICE_CANCEL_JOB = "cancel_job"
 SERVICE_START_STOP_BLADES = "start_stop_blades"
 SERVICE_SET_NON_WORK_HOURS = "set_non_work_hours"
@@ -114,6 +118,24 @@ def get_entity_attribute(
     return None
 
 
+def get_area_hash(hass: HomeAssistant, entity_id: str) -> int | None:
+    """Return an area hash from state attributes or the entity registry."""
+    if entity_hash := get_entity_attribute(hass, entity_id, "hash"):
+        try:
+            return int(entity_hash)
+        except (TypeError, ValueError):
+            LOGGER.debug("Invalid area hash attribute on %s: %s", entity_id, entity_hash)
+
+    registry_entry = er.async_get(hass).async_get(entity_id)
+    if registry_entry is None or registry_entry.platform != DOMAIN:
+        return None
+
+    suffix = registry_entry.unique_id.rsplit("_", 1)[-1]
+    if suffix.lstrip("-").isdigit():
+        return int(suffix)
+    return None
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: MammotionConfigEntry,
@@ -144,6 +166,30 @@ async def async_setup_entry(
         entity_domain=LAWN_MOWER_DOMAIN,
         schema=None,
         func="async_cancel",
+    )
+    service.async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        SERVICE_RESUME_TASK,
+        entity_domain=LAWN_MOWER_DOMAIN,
+        schema=None,
+        func="async_resume_task",
+    )
+    service.async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        SERVICE_BREAK_POINT_CONTINUE,
+        entity_domain=LAWN_MOWER_DOMAIN,
+        schema=None,
+        func="async_break_point_continue",
+    )
+    service.async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        SERVICE_BREAK_POINT_ANYWHERE_CONTINUE,
+        entity_domain=LAWN_MOWER_DOMAIN,
+        schema=None,
+        func="async_break_point_anywhere_continue",
     )
     service.async_register_platform_entity_service(
         hass,
@@ -236,12 +282,14 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
         if kwargs:
             entity_ids = kwargs.pop("areas", [])
             attributes = [
-                # TODO this should not need to be cast.
-                int(entity_hash)
+                entity_hash
                 for entity_id in entity_ids
-                if (entity_hash := get_entity_attribute(self.hass, entity_id, "hash"))
-                is not None
+                if (entity_hash := get_area_hash(self.hass, entity_id)) is not None
             ]
+            if entity_ids and not attributes:
+                raise HomeAssistantError(
+                    "No Mammotion area hashes could be resolved from the selected areas."
+                )
             modify_plan = kwargs.pop("modify", False)
             plan_only = kwargs.pop("plan_only", False)
 
@@ -294,7 +342,11 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                 if mode == WorkMode.MODE_PAUSE:
                     trans_key = "resume_failed"
                     if breakpoint_info != 0:
-                        await self.coordinator.async_send_command("resume_execute_task")
+                        await self.coordinator.async_send_and_wait(
+                            "resume_execute_task",
+                            "todev_taskctrl_ack",
+                            raise_on_failure=True,
+                        )
                         await self.coordinator.async_send_and_wait(
                             "query_generate_route_information", "bidire_reqconver_path"
                         )
@@ -319,6 +371,70 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                 ) from exc
             finally:
                 await self.coordinator.async_request_report_snapshot()
+
+    async def async_resume_task(self) -> None:
+        """Resume an existing paused task without planning or starting a new task."""
+        await self.coordinator.async_ensure_fresh_state()
+
+        mode = self.rpt_dev_status.sys_status
+        breakpoint_info = self.report_data.work.bp_info
+        if mode is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="device_not_ready"
+            )
+        if mode != WorkMode.MODE_PAUSE:
+            raise HomeAssistantError(
+                f"Cannot resume task while mower mode is {mode!s}; expected MODE_PAUSE."
+            )
+        if breakpoint_info == 0:
+            raise HomeAssistantError("Cannot resume task because no breakpoint exists.")
+
+        try:
+            await self.coordinator.async_send_and_wait(
+                "resume_execute_task",
+                "todev_taskctrl_ack",
+                raise_on_failure=True,
+            )
+        except COMMAND_EXCEPTIONS as exc:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="resume_failed"
+            ) from exc
+        finally:
+            await self.coordinator.async_request_report_snapshot()
+
+    async def async_break_point_continue(self) -> None:
+        """Resume an unfinished task from its stored breakpoint."""
+        await self._async_send_breakpoint_resume("break_point_continue")
+
+    async def async_break_point_anywhere_continue(self) -> None:
+        """Resume an unfinished task from the mower's current position."""
+        await self._async_send_breakpoint_resume("break_point_anywhere_continue")
+
+    async def _async_send_breakpoint_resume(self, command: str) -> None:
+        """Send a breakpoint resume command and require task-control ack."""
+        await self.coordinator.async_ensure_fresh_state()
+
+        mode = self.rpt_dev_status.sys_status
+        breakpoint_info = self.report_data.work.bp_info
+        if mode is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="device_not_ready"
+            )
+        if breakpoint_info == 0:
+            raise HomeAssistantError("Cannot resume task because no breakpoint exists.")
+
+        try:
+            await self.coordinator.async_send_and_wait(
+                command,
+                "todev_taskctrl_ack",
+                raise_on_failure=True,
+            )
+        except COMMAND_EXCEPTIONS as exc:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="resume_failed"
+            ) from exc
+        finally:
+            await self.coordinator.async_request_report_snapshot()
 
     async def async_dock(self) -> None:
         """Start docking."""

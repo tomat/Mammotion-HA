@@ -129,7 +129,7 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
     MammotionButtonSensorEntityDescription(
         key="emergency_nudge_forward",
         press_fn=lambda coordinator: coordinator.async_nudge_forward(
-            0.4,
+            1.0,
             _nudge_use_wifi(coordinator),
         ),
         available_fn=_nudge_available,
@@ -137,7 +137,7 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
     MammotionButtonSensorEntityDescription(
         key="emergency_nudge_left",
         press_fn=lambda coordinator: coordinator.async_nudge_left(
-            0.4,
+            1.0,
             _nudge_use_wifi(coordinator),
         ),
         available_fn=_nudge_available,
@@ -145,7 +145,7 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
     MammotionButtonSensorEntityDescription(
         key="emergency_nudge_right",
         press_fn=lambda coordinator: coordinator.async_nudge_right(
-            0.4,
+            1.0,
             _nudge_use_wifi(coordinator),
         ),
         available_fn=_nudge_available,
@@ -153,7 +153,7 @@ BUTTON_SENSORS: tuple[MammotionButtonSensorEntityDescription, ...] = (
     MammotionButtonSensorEntityDescription(
         key="emergency_nudge_back",
         press_fn=lambda coordinator: coordinator.async_nudge_back(
-            0.4,
+            1.0,
             _nudge_use_wifi(coordinator),
         ),
         available_fn=_nudge_available,

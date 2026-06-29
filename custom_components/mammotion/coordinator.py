@@ -79,6 +79,7 @@ from pymammotion.transport.base import (
 from pymammotion.transport.ble import BLETransport
 from pymammotion.utility.constant import MOWING_ACTIVE_MODES, WorkMode
 from pymammotion.utility.device_type import DeviceType
+from pymammotion.utility.movement import get_percent, transform_both_speeds
 from pymammotion.utility.plan_id import make_copy_name, new_mower_plan_id
 from pymammotion.utility.svg import chunk_svg_messages
 from webrtc_models import RTCIceServer
@@ -110,10 +111,10 @@ MAP_INTERVAL = timedelta(minutes=60)
 RTK_INTERVAL = timedelta(hours=5)
 SPINO_INTERVAL = timedelta(weeks=1)
 MOVEMENT_NUDGE_INTERVAL = 0.2
-MOVEMENT_NUDGE_STEPS = 25
+MOVEMENT_NUDGE_STEPS = 50
 MOVEMENT_MANUAL_KEEPALIVE_STEPS = 4
 MOVEMENT_MANUAL_START_KEEPALIVES = 2
-MOVEMENT_MANUAL_MAX_RUN_SPEED = 0.3
+MOVEMENT_MANUAL_MAX_RUN_SPEED = 1.2
 MOVEMENT_BLE_MIN_RSSI = -75
 
 
@@ -223,6 +224,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         bypass_local_rate_limit = bool(
             kwargs.pop("_bypass_local_rate_limit", False)
         )
+        quiet_rate_limit_clear = bool(kwargs.pop("_quiet_rate_limit_clear", False))
         record_cmd = bool(kwargs.pop("_record_cmd", False))
         runtime_data = getattr(self.config_entry, "runtime_data", None)
         video_client = getattr(runtime_data, "video_client", None)
@@ -233,6 +235,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                     self.device.iot_id,
                     command,
                     _bypass_local_rate_limit=bypass_local_rate_limit,
+                    _quiet_rate_limit_clear=quiet_rate_limit_clear,
                     _record_cmd=record_cmd,
                     **kwargs,
                 )
@@ -258,7 +261,10 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             return False
 
         if bypass_local_rate_limit:
-            self._clear_cloud_command_rate_limits(reason=f"command {command}")
+            self._clear_cloud_command_rate_limits(
+                reason=f"command {command}",
+                quiet=quiet_rate_limit_clear,
+            )
 
         return await self.async_send_command(
             command,
@@ -496,6 +502,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self,
         command: str,
         expected_field: str,
+        raise_on_failure: bool = False,
         **kwargs: Any,
     ) -> None:
         """Send a command and wait for response with standard exception handling.
@@ -503,9 +510,16 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         Handles credential expiry, gateway/transport timeouts, and device-offline
         conditions uniformly.  Re-raises DeviceOfflineException after marking the
         device offline so callers can bail out of their update loops.
+
+        Set raise_on_failure when the caller needs a missing acknowledgement to
+        fail the service call instead of being treated as a best-effort command.
         """
         device = self.manager.get_device_by_name(self.device_name)
         if device is None or not self.is_online():
+            if raise_on_failure:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN, translation_key="device_not_ready"
+                )
             return
 
         try:
@@ -523,18 +537,27 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             device = self.manager.get_device_by_name(self.device_name)
             if device is not None:
                 self.device_offline(device)
+            if raise_on_failure:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN, translation_key="device_not_ready"
+                )
         except TooManyRequestsException as exc:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="api_limit_exceeded"
             ) from exc
         except NoTransportAvailableError as exc:
             LOGGER.debug(f"No Transport: {exc}")
+            if raise_on_failure:
+                raise
         except (
             GatewayTimeoutException,
             CommandTimeoutError,
             ConcurrentRequestError,
-        ):
-            pass
+        ) as exc:
+            if raise_on_failure:
+                raise TimeoutError(
+                    f"Timed out waiting for {expected_field} after {command}"
+                ) from exc
         except asyncio.CancelledError:
             # bleak_retry_connector raises CancelledError when no BLE slot is
             # available (it cancels its own internal sleep).  Re-raise only when
@@ -1009,7 +1032,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         await self.manager.add_ble_to_device(self.device_name, ble_device)
 
     async def async_move_forward(self, speed: float, use_wifi: bool = False) -> None:
-        """Move forward. Prefer BLE unless use_wifi=True (lower latency for manual control)."""
+        """Move forward. Prefer BLE unless Wi-Fi is explicitly requested."""
         if not use_wifi:
             await self._async_ensure_ble_client()
         await self.async_send_command(
@@ -1040,12 +1063,80 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
             "move_back", prefer_ble=not use_wifi, linear=speed
         )
 
+    @staticmethod
+    def _movement_vector_to_speeds(
+        linear: float,
+        angular: float,
+    ) -> tuple[int, int]:
+        """Convert normalized joystick axes into Mammotion movement speeds."""
+        linear = max(-1.0, min(1.0, float(linear)))
+        angular = max(-1.0, min(1.0, float(angular)))
+        linear_angle = 90.0 if linear >= 0 else 270.0
+        angular_angle = 0.0 if angular >= 0 else 180.0
+        linear_percent = get_percent(abs(linear * 100.0))
+        angular_percent = get_percent(abs(angular * 100.0))
+        speeds = transform_both_speeds(
+            linear_angle,
+            angular_angle,
+            linear_percent,
+            angular_percent,
+        )
+        if not speeds:
+            return 0, 0
+        linear_speed, angular_speed = speeds
+        return int(linear_speed), int(angular_speed)
+
+    async def async_move_vector(
+        self,
+        linear: float,
+        angular: float,
+        use_wifi: bool = False,
+    ) -> None:
+        """Move with app-style normalized joystick axes.
+
+        ``linear`` is forward/backward (-1.0..1.0, positive forward).
+        ``angular`` is left/right (-1.0..1.0, positive right).
+        """
+        if not use_wifi:
+            await self._async_ensure_ble_client()
+        linear_speed, angular_speed = self._movement_vector_to_speeds(
+            linear,
+            angular,
+        )
+        await self._async_movement_command(
+            "send_movement",
+            use_wifi,
+            bypass_local_rate_limit=True,
+            quiet_rate_limit_clear=True,
+            linear_speed=linear_speed,
+            angular_speed=angular_speed,
+        )
+
+    async def async_start_manual_drive(self, use_wifi: bool = False) -> None:
+        """Enable manual drive mode and set the app's max run speed."""
+        if not use_wifi:
+            await self._async_ensure_ble_client()
+        else:
+            self._clear_cloud_command_rate_limits(
+                reason="joystick manual drive start",
+            )
+        await self._async_manual_drive_speed(use_wifi)
+        await self._async_manual_drive_mode(True, use_wifi)
+
+    async def async_stop_manual_drive(self, use_wifi: bool = False) -> None:
+        """Stop movement and leave manual drive mode."""
+        if not use_wifi:
+            await self._async_ensure_ble_client()
+        await self._async_movement_stop(use_wifi)
+        await self._async_manual_drive_mode(False, use_wifi)
+
     async def _async_movement_stop(self, use_wifi: bool) -> bool | None:
         """Queue a zero-speed movement frame."""
         return await self._async_movement_command(
-            "move_forward",
+            "send_movement",
             use_wifi,
-            linear=0.0,
+            linear_speed=0,
+            angular_speed=0,
         )
 
     async def _async_manual_drive_mode(
@@ -1075,16 +1166,44 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         self,
         command: str,
         use_wifi: bool,
+        *,
+        bypass_local_rate_limit: bool = True,
+        quiet_rate_limit_clear: bool = False,
         **kwargs: Any,
     ) -> bool | None:
         """Queue a nudge command on the selected movement transport."""
         if use_wifi:
+            if bypass_local_rate_limit:
+                self._clear_cloud_command_rate_limits(
+                    reason=f"manual movement {command}",
+                    quiet=quiet_rate_limit_clear,
+                )
+
+            result = await self.async_send_command(
+                command,
+                prefer_ble=False,
+                _record_cmd=False,
+                _priority=Priority.EMERGENCY,
+                _log_failures=True,
+                **kwargs,
+            )
+            if result:
+                return result
+
+            if not quiet_rate_limit_clear:
+                LOGGER.warning(
+                    "Primary Mammotion cloud movement command %s did not queue "
+                    "for %s; trying secondary video account",
+                    command,
+                    self.device_name,
+                )
             return await self.async_send_video_command(
                 command,
                 _record_cmd=False,
                 _priority=Priority.EMERGENCY,
                 _log_failures=True,
-                _bypass_local_rate_limit=True,
+                _bypass_local_rate_limit=bypass_local_rate_limit,
+                _quiet_rate_limit_clear=quiet_rate_limit_clear,
                 **kwargs,
             )
 
@@ -1230,7 +1349,12 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 self.device_name,
             )
 
-    def _clear_cloud_command_rate_limits(self, *, reason: str) -> None:
+    def _clear_cloud_command_rate_limits(
+        self,
+        *,
+        reason: str,
+        quiet: bool = False,
+    ) -> None:
         """Clear local cloud send-budget latches before user-requested nudges."""
         handle = self.manager.mower(self.device_name)
         if handle is None:
@@ -1255,7 +1379,7 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 isinstance(gateway_until, (int, float)) and gateway_until > now
             )
 
-            if rate_limited or gateway_limited or send_count:
+            if (rate_limited or gateway_limited or send_count) and not quiet:
                 LOGGER.warning(
                     "Clearing local %s cloud send budget for %s on %s "
                     "(transport_limited=%s, gateway_limited=%s, sent=%d)",
@@ -1844,8 +1968,38 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
         if area_hash == 0:
             return None
 
+        def _registry_area_name() -> str | None:
+            registry = er.async_get(self.hass)
+            entity_id = registry.async_get_entity_id(
+                "switch", DOMAIN, f"{self.unique_name}_{area_hash}"
+            )
+            registry_entry = registry.async_get(entity_id) if entity_id else None
+            if registry_entry is None:
+                return None
+            for candidate in (registry_entry.name, registry_entry.original_name):
+                candidate = (candidate or "").strip()
+                if not candidate:
+                    continue
+                for prefix in ("Mammotion Yuka Area ", "Area "):
+                    if candidate.startswith(prefix):
+                        candidate = candidate[len(prefix) :].strip()
+                if candidate and candidate != "Area":
+                    return candidate
+            return None
+
         name = None
         _mower_data = cast(MowingDevice, self.data)
+        area_name: AreaHashNameList | None = next(
+            (
+                area
+                for area in _mower_data.map.area_name
+                if area.hash == area_hash and area.name
+            ),
+            None,
+        )
+        if area_name is not None:
+            return area_name.name
+
         if area_data := _mower_data.map.area.get(area_hash):
             area_frame = area_data.data[0] if len(area_data.data) > 0 else None
             if area_frame is not None:
@@ -1859,9 +2013,9 @@ class MammotionBaseUpdateCoordinator[DataT](DataUpdateCoordinator[DataT]):  # ty
                 )
                 name = area_name.name if area_name is not None else None
         else:
-            return "path"
+            return _registry_area_name() or "path"
 
-        return name if name else f"area {area_hash}"
+        return name or _registry_area_name() or f"area {area_hash}"
 
 
 class MammotionReportUpdateCoordinator(MammotionBaseUpdateCoordinator[MowingDevice]):

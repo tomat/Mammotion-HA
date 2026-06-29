@@ -3,6 +3,21 @@ cancel_job:
     entity:
       integration: mammotion
       domain: lawn_mower
+resume_task:
+  target:
+    entity:
+      integration: mammotion
+      domain: lawn_mower
+break_point_continue:
+  target:
+    entity:
+      integration: mammotion
+      domain: lawn_mower
+break_point_anywhere_continue:
+  target:
+    entity:
+      integration: mammotion
+      domain: lawn_mower
 start_mow:
   target:
     entity:
@@ -772,3 +787,59 @@ start_task:
     entity:
       integration: mammotion
       domain: button
+
+start_manual_drive:
+  target:
+    entity:
+      integration: mammotion
+      domain: camera
+  fields:
+    use_wifi:
+      required: false
+      default: false
+      selector:
+        boolean:
+
+stop_manual_drive:
+  target:
+    entity:
+      integration: mammotion
+      domain: camera
+  fields:
+    use_wifi:
+      required: false
+      default: false
+      selector:
+        boolean:
+
+move_vector:
+  target:
+    entity:
+      integration: mammotion
+      domain: camera
+  fields:
+    linear:
+      required: false
+      default: 0
+      example: 0.8
+      selector:
+        number:
+          min: -1
+          max: 1
+          step: 0.01
+          mode: slider
+    angular:
+      required: false
+      default: 0
+      example: 0.3
+      selector:
+        number:
+          min: -1
+          max: 1
+          step: 0.01
+          mode: slider
+    use_wifi:
+      required: false
+      default: false
+      selector:
+        boolean:

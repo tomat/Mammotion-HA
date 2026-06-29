@@ -2631,55 +2631,86 @@ class MammotionDeviceErrorUpdateCoordinator(
             except json.JSONDecodeError:
                 """Failed to parse warning event."""
 
+    def _get_error_pair(self, number: int) -> tuple[int, int] | None:
+        """Return the nth prioritized active error pair."""
+        if error_pair_fn := getattr(self.data.errors, "error_pair", None):
+            return error_pair_fn(number)
+
+        if number < 1:
+            return None
+
+        indexed_pairs: list[tuple[int, int, int, int]] = []
+        for index, (code, timestamp) in enumerate(
+            zip(
+                self.data.errors.err_code_list,
+                self.data.errors.err_code_list_time,
+                strict=False,
+            )
+        ):
+            code = int(code)
+            timestamp = int(timestamp)
+            abs_code = abs(code)
+            if abs_code == 0:
+                priority = 2
+            elif str(abs_code) in self.data.errors.error_codes:
+                priority = 0
+            else:
+                priority = 1
+            indexed_pairs.append((priority, index, code, timestamp))
+
+        active_pairs = [
+            (code, timestamp)
+            for priority, _index, code, timestamp in sorted(indexed_pairs)
+            if priority < 2
+        ]
+        try:
+            return active_pairs[number - 1]
+        except IndexError:
+            return None
+
     def get_error_code(self, number: int) -> int:
         """Get error code from an error code list."""
-        try:
-            return int(abs(next(iter(self.data.errors.err_code_list))))
-        except StopIteration:
-            return 0
+        if error_pair := self._get_error_pair(number):
+            return int(abs(error_pair[0]))
+        return 0
 
     def get_error_time(self, number: int) -> datetime.datetime | None:
         """Get error time from an error code list."""
-        try:
+        if error_pair := self._get_error_pair(number):
             return datetime.datetime.fromtimestamp(
-                next(iter(self.data.errors.err_code_list_time)), datetime.UTC
+                error_pair[1], datetime.UTC
             )
-        except StopIteration:
-            return None
+        return None
 
     def get_error_message(self, number: int) -> str:
         """Return error message."""
-        try:
-            error_code: int = next(iter(self.data.errors.err_code_list))
+        if error_pair := self._get_error_pair(number):
+            try:
+                error_code = abs(error_pair[0])
+                error_info: ErrorInfo = self.data.errors.error_codes[f"{error_code}"]
 
-            error_code = abs(error_code)
-            error_info: ErrorInfo = self.data.errors.error_codes[f"{error_code}"]
+                implication = (
+                    getattr(error_info, f"{self.hass.config.language}_implication")
+                    if hasattr(error_info, f"{self.hass.config.language}_implication")
+                    else error_info.en_implication
+                )
+                solution = (
+                    getattr(error_info, f"{self.hass.config.language}_solution")
+                    if hasattr(error_info, f"{self.hass.config.language}_solution")
+                    else error_info.en_solution
+                )
 
-            implication = (
-                getattr(error_info, f"{self.hass.config.language}_implication")
-                if hasattr(error_info, f"{self.hass.config.language}_implication")
-                else error_info.en_implication
-            )
-            solution = (
-                getattr(error_info, f"{self.hass.config.language}_solution")
-                if hasattr(error_info, f"{self.hass.config.language}_solution")
-                else error_info.en_solution
-            )
+                if implication == "":
+                    implication = error_info.en_implication
 
-            if implication == "":
-                implication = error_info.en_implication
+                if solution == "":
+                    solution = error_info.en_solution
 
-            if solution == "":
-                solution = error_info.en_solution
-
-            return f"{error_info.module}: {implication}, {solution}"
-
-        except StopIteration:
-            """Failed to get error code."""
-            return "No Error"
-        except KeyError:
-            """Failed to get error message."""
-            return "Error message not found"
+                return f"{error_info.module}: {implication}, {solution}"
+            except KeyError:
+                """Failed to get error message."""
+                return "Error message not found"
+        return "No Error"
 
     async def _async_update_data(self) -> MowingDevice:
         """Get data from the device."""

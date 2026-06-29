@@ -3,6 +3,7 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from datetime import time
 from functools import partial
 
@@ -749,6 +750,10 @@ class MammotionTaskAreaSensorEntity(MammotionBaseEntity, SensorEntity):
         Overrides _attr_translation_placeholders so HA picks up the new name
         on the next state write without recreating the entity.
         """
+        self.entity_description = dataclass_replace(
+            self.entity_description,
+            translation_placeholders={"name": new_name},
+        )
         self._attr_translation_placeholders = {"name": new_name}
         if self.hass is not None:
             self.async_write_ha_state()
@@ -777,6 +782,11 @@ def async_add_task_area_entities(
 
     new_hashes = current_ids - added_task_areas
     sensor_entities: list[MammotionTaskAreaSensorEntity] = []
+
+    for area_hash in sorted(current_ids & added_task_areas):
+        if entity := entities_by_hash.get(area_hash):
+            area_name = coordinator.get_area_entity_name(area_hash) or f"area {area_hash}"
+            entity.update_name(area_name)
 
     for area_hash in sorted(new_hashes):
         area_name = coordinator.get_area_entity_name(area_hash) or f"area {area_hash}"

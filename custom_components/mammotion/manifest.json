@@ -23,6 +23,6 @@
   "loggers": ["pymammotion"],
   "iot_class": "local_push",
   "requirements": [
-    "pymammotion @ https://github.com/tomat/PyMammotion/archive/2c67fa08ba007c84ad30e72f70f389c5948b3a8c.zip"
+    "pymammotion @ https://github.com/tomat/PyMammotion/archive/1252c61100a11c7d297126d4d0ea7ec769630e90.zip"
   ]
 }

@@ -3,6 +3,11 @@ cancel_job:
     entity:
       integration: mammotion
       domain: lawn_mower
+cancel_pause_execute_task:
+  target:
+    entity:
+      integration: mammotion
+      domain: lawn_mower
 resume_task:
   target:
     entity:

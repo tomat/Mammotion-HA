@@ -14,6 +14,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.restore_state import RestoreEntity
 from pymammotion.data.model.device import PoolCleanerDevice
 from pymammotion.data.model.pool_state import SpinoToggle
@@ -31,6 +32,8 @@ from .entity import MammotionBaseEntity, MammotionBaseSpinoEntity
 # Matches pymammotion's auto-generated fallback names ("area 1", "area 2", …).
 # These carry no user intent and must be treated the same as empty names.
 _PYMAMMOTION_AUTO_NAME = re.compile(r"^area\s+\d+$", re.IGNORECASE)
+_AREA_ENTITIES_UPDATED_EVENT = "mammotion_area_entities_updated"
+_AREA_ENTITIES_UPDATED_EVENT_DELAY = 1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -473,6 +476,7 @@ class MammotionConfigAreaSwitchEntity(MammotionBaseEntity, SwitchEntity, Restore
             name=new_name,
             translation_placeholders={"name": new_name},
         )
+        self._attr_translation_placeholders = {"name": new_name}
         self._pushed_name = new_name
         if self.hass is not None:
             self.async_write_ha_state()
@@ -559,17 +563,26 @@ def async_add_area_entities(
         return
 
     switch_entities: list[MammotionConfigAreaSwitchEntity] = []
+    area_entities_changed = False
     computed = coordinator.data.map.computed_areas
     all_current_areas = {a.hash for a in computed}
     map_area_hashes: set[int] = {
         int(k) for k in coordinator.data.map.area.keys() if str(k).lstrip("-").isdigit()
     }
 
-    # Trigger re-fetch when the device hasn't yet sent names for all areas.
+    # Trigger re-fetch when the device hasn't yet sent real names for all areas.
     # Luba 1 never provides area_name, so skip for it.
     if not DeviceType.is_luba1(coordinator.device_name):
-        area_name_hashes: set[int] = {a.hash for a in coordinator.data.map.area_name}
-        if map_area_hashes - area_name_hashes:
+        area_names_by_hash: dict[int, str] = {
+            a.hash: (a.name or "").strip() for a in coordinator.data.map.area_name
+        }
+        missing_or_unnamed_hashes: set[int] = {
+            area_hash
+            for area_hash in map_area_hashes
+            if not area_names_by_hash.get(area_hash)
+            or _PYMAMMOTION_AUTO_NAME.match(area_names_by_hash[area_hash])
+        }
+        if missing_or_unnamed_hashes:
             coordinator.hass.async_create_task(coordinator.async_get_area_list())
 
     # Startup registry cleanup: remove stale entries from previous sessions.
@@ -617,6 +630,7 @@ def async_add_area_entities(
                             del area_entities_by_name[current_name]
                         entity.update_name(new_name)
                         area_entities_by_name[new_name] = entity
+                        area_entities_changed = True
             continue
 
         # Not yet tracked — for real (non-auto) names, update the existing entity's
@@ -629,6 +643,7 @@ def async_add_area_entities(
             added_areas.discard(existing._area)
             existing.update_area(area_id)
             added_areas.add(area_id)
+            area_entities_changed = True
             continue
 
         # Missing area — add a new entity with the name supplied by computed_areas.
@@ -644,6 +659,7 @@ def async_add_area_entities(
         switch_entities.append(entity)
         area_entities_by_name[new_name] = entity
         added_areas.add(area_id)
+        area_entities_changed = True
 
     # Guard: only remove when map.area is non-empty — an empty map is a transient
     # refresh state and must not wipe the entity registry.
@@ -657,9 +673,35 @@ def async_add_area_entities(
                     n for n, e in list(area_entities_by_name.items()) if e._area == area
                 ]:
                     del area_entities_by_name[n]
+                area_entities_changed = True
 
     if switch_entities:
         async_add_entities(switch_entities)
+    if area_entities_changed:
+        _async_schedule_area_entities_updated_event(coordinator)
+
+
+@callback
+def _async_schedule_area_entities_updated_event(
+    coordinator: MammotionReportUpdateCoordinator,
+) -> None:
+    """Fire an HA event shortly after dynamic area entities change."""
+
+    @callback
+    def _fire_event(_: Any) -> None:
+        coordinator.hass.bus.async_fire(
+            _AREA_ENTITIES_UPDATED_EVENT,
+            {
+                "device_name": coordinator.device_name,
+                "unique_name": coordinator.unique_name,
+            },
+        )
+
+    async_call_later(
+        coordinator.hass,
+        _AREA_ENTITIES_UPDATED_EVENT_DELAY,
+        _fire_event,
+    )
 
 
 def _async_clean_stale_area_registry_entries(

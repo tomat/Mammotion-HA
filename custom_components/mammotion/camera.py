@@ -328,17 +328,30 @@ async def async_setup_platform_services(
 
     def _get_mower_by_entity_id(entity_id: str) -> MammotionMowerData | None:
         state = hass.states.get(entity_id)
-        if state is None:
-            return None
-        name = state.attributes.get("model_name")
-        return next(
-            (
-                mower
-                for mower in entry.runtime_data.mowers
-                if mower.device.device_name == name
-            ),
-            None,
-        )
+        name = state.attributes.get("model_name") if state is not None else None
+        if name:
+            return next(
+                (
+                    mower
+                    for mower in entry.runtime_data.mowers
+                    if mower.device.device_name == name
+                ),
+                None,
+            )
+
+        eligible_mowers = [
+            mower
+            for mower in entry.runtime_data.mowers
+            if not DeviceType.is_luba1(mower.device.device_name)
+        ]
+        if len(eligible_mowers) == 1:
+            _LOGGER.debug(
+                "Falling back to the only Mammotion camera-capable mower for %s",
+                entity_id,
+            )
+            return eligible_mowers[0]
+
+        return None
 
     def _has_agora_join_fields(
         stream_data: StreamSubscriptionResponse | None,

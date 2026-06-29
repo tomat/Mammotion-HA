@@ -30,6 +30,7 @@ from .coordinator import MammotionReportUpdateCoordinator
 from .entity import MammotionBaseEntity
 
 SERVICE_START_MOWING = "start_mow"
+SERVICE_CANCEL_PAUSE_EXECUTE_TASK = "cancel_pause_execute_task"
 SERVICE_RESUME_TASK = "resume_task"
 SERVICE_BREAK_POINT_CONTINUE = "break_point_continue"
 SERVICE_BREAK_POINT_ANYWHERE_CONTINUE = "break_point_anywhere_continue"
@@ -166,6 +167,14 @@ async def async_setup_entry(
         entity_domain=LAWN_MOWER_DOMAIN,
         schema=None,
         func="async_cancel",
+    )
+    service.async_register_platform_entity_service(
+        hass,
+        DOMAIN,
+        SERVICE_CANCEL_PAUSE_EXECUTE_TASK,
+        entity_domain=LAWN_MOWER_DOMAIN,
+        schema=None,
+        func="async_cancel_pause_execute_task",
     )
     service.async_register_platform_entity_service(
         hass,
@@ -345,7 +354,6 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
                         await self.coordinator.async_send_and_wait(
                             "resume_execute_task",
                             "todev_taskctrl_ack",
-                            raise_on_failure=True,
                         )
                         await self.coordinator.async_send_and_wait(
                             "query_generate_route_information", "bidire_reqconver_path"
@@ -372,6 +380,20 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
             finally:
                 await self.coordinator.async_request_report_snapshot()
 
+    async def async_cancel_pause_execute_task(self) -> None:
+        """Send the APK Continue Working command without local preflight checks."""
+        try:
+            await self.coordinator.async_send_command(
+                "resume_execute_task",
+                _log_failures=True,
+            )
+        except COMMAND_EXCEPTIONS as exc:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="resume_failed"
+            ) from exc
+        finally:
+            await self.coordinator.async_request_report_snapshot()
+
     async def async_resume_task(self) -> None:
         """Resume an existing paused task without planning or starting a new task."""
         await self.coordinator.async_ensure_fresh_state()
@@ -393,7 +415,6 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
             await self.coordinator.async_send_and_wait(
                 "resume_execute_task",
                 "todev_taskctrl_ack",
-                raise_on_failure=True,
             )
         except COMMAND_EXCEPTIONS as exc:
             raise HomeAssistantError(
@@ -427,7 +448,6 @@ class MammotionLawnMowerEntity(MammotionBaseEntity, LawnMowerEntity):  # type: i
             await self.coordinator.async_send_and_wait(
                 command,
                 "todev_taskctrl_ack",
-                raise_on_failure=True,
             )
         except COMMAND_EXCEPTIONS as exc:
             raise HomeAssistantError(
